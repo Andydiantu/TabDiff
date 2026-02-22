@@ -1,5 +1,6 @@
 from typing import Callable, Union
 
+from tabdiff.modules.low_rank import LowRankLinear
 from tabdiff.modules.transformer import Reconstructor, Tokenizer, Transformer
 import torch
 import torch.nn as nn
@@ -28,21 +29,43 @@ class PositionalEmbedding(torch.nn.Module):
 
 
 class MLPDiffusion(nn.Module):
-    def __init__(self, d_in, dim_t = 512, use_mlp=True):
+    def __init__(self, d_in, dim_t = 512, use_mlp=True,
+                 low_rank_mode='none', rank_percentage=0.5,
+                 dynamic_rank_init_mode='match_high_rank'):
         super().__init__()
         self.dim_t = dim_t
+        self.low_rank_mode = low_rank_mode
 
         self.proj = nn.Linear(d_in, dim_t)
 
+        def _make_linear(in_f, out_f, bias=True):
+            """Create nn.Linear or LowRankLinear depending on low_rank_mode."""
+            if low_rank_mode == 'none':
+                return nn.Linear(in_f, out_f, bias=bias)
+            else:
+                pct = rank_percentage
+                if low_rank_mode == 'dynamic':
+                    pct = LowRankLinear.compute_adjusted_rank_percentage(
+                        in_features=in_f,
+                        out_features=out_f,
+                        rank_percentage=rank_percentage,
+                        r_min_ratio=0.4,
+                        logistic_k=8.0,
+                        logistic_m=0.6,
+                        sampling_eps=1e-3,
+                        mode=dynamic_rank_init_mode,
+                    )
+                return LowRankLinear(in_f, out_f, rank_percentage=pct, bias=bias)
+
         self.mlp = nn.Sequential(
-            nn.Linear(dim_t, dim_t * 2),
+            _make_linear(dim_t, dim_t * 2),
             nn.SiLU(),
-            nn.Linear(dim_t * 2, dim_t * 2),
+            _make_linear(dim_t * 2, dim_t * 2),
             nn.SiLU(),
-            nn.Linear(dim_t * 2, dim_t),
+            _make_linear(dim_t * 2, dim_t),
             nn.SiLU(),
-            nn.Linear(dim_t, d_in),
-        ) if use_mlp else nn.Linear(dim_t, d_in)
+            _make_linear(dim_t, d_in),
+        ) if use_mlp else _make_linear(dim_t, d_in)
 
         self.map_noise = PositionalEmbedding(num_channels=dim_t)
         self.time_embed = nn.Sequential(
@@ -52,14 +75,35 @@ class MLPDiffusion(nn.Module):
         )
         
         self.use_mlp = use_mlp
+
+    def _inject_timestep(self, timestep):
+        """Set timestep on all LowRankLinear children for dynamic gating."""
+        for module in self.modules():
+            if isinstance(module, LowRankLinear):
+                module._timestep = timestep
+
+    def _clear_timestep(self):
+        """Clear timestep from all LowRankLinear children."""
+        for module in self.modules():
+            if isinstance(module, LowRankLinear):
+                module._timestep = None
     
-    def forward(self, x, timesteps):
+    def forward(self, x, timesteps, t_for_rank=None):
         emb = self.map_noise(timesteps)
         emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
         emb = self.time_embed(emb)
     
         x = self.proj(x) + emb
-        return self.mlp(x)
+
+        if self.low_rank_mode == 'dynamic' and t_for_rank is not None:
+            self._inject_timestep(t_for_rank)
+
+        out = self.mlp(x)
+
+        if self.low_rank_mode == 'dynamic' and t_for_rank is not None:
+            self._clear_timestep()
+
+        return out
     
 class UniModMLP(nn.Module):
     """
@@ -72,7 +116,10 @@ class UniModMLP(nn.Module):
     """
     def __init__(
             self, d_numerical, categories, num_layers, d_token,
-            n_head = 1, factor = 4, bias = True, dim_t=512, use_mlp=True, **kwargs
+            n_head = 1, factor = 4, bias = True, dim_t=512, use_mlp=True,
+            low_rank_mode='none', rank_percentage=0.5,
+            dynamic_rank_init_mode='match_high_rank',
+            **kwargs
         ):
         super().__init__()
         self.d_numerical = d_numerical
@@ -81,17 +128,22 @@ class UniModMLP(nn.Module):
         self.tokenizer = Tokenizer(d_numerical, categories, d_token, bias = bias)
         self.encoder = Transformer(num_layers, d_token, n_head, d_token, factor)
         d_in = d_token * (d_numerical + len(categories))
-        self.mlp = MLPDiffusion(d_in, dim_t=dim_t, use_mlp=use_mlp)
+        self.mlp = MLPDiffusion(
+            d_in, dim_t=dim_t, use_mlp=use_mlp,
+            low_rank_mode=low_rank_mode,
+            rank_percentage=rank_percentage,
+            dynamic_rank_init_mode=dynamic_rank_init_mode,
+        )
         self.decoder = Transformer(num_layers, d_token, n_head, d_token, factor)
         self.detokenizer = Reconstructor(d_numerical, categories, d_token)
         
         self.model = nn.ModuleList([self.tokenizer, self.encoder, self.mlp, self.decoder, self.detokenizer])
 
-    def forward(self, x_num, x_cat, timesteps):
+    def forward(self, x_num, x_cat, timesteps, t_for_rank=None):
         e = self.tokenizer(x_num, x_cat)
         decoder_input = e[:, 1:, :]        # ignore the first CLS token. 
         y = self.encoder(decoder_input)
-        pred_y = self.mlp(y.reshape(y.shape[0], -1), timesteps)
+        pred_y = self.mlp(y.reshape(y.shape[0], -1), timesteps, t_for_rank=t_for_rank)
         pred_e = self.decoder(pred_y.reshape(*y.shape))
         x_num_pred, x_cat_pred = self.detokenizer(pred_e)
         x_cat_pred = torch.cat(x_cat_pred, dim=-1) if len(x_cat_pred)>0 else torch.zeros_like(x_cat).to(x_num_pred.dtype)
@@ -129,9 +181,9 @@ class Precond(nn.Module):
 
         x_in = c_in * x_num
         if self.net_conditioning == "sigma":
-            F_x, x_cat_pred = self.denoise_fn_F(x_in, x_cat, c_noise.flatten())
+            F_x, x_cat_pred = self.denoise_fn_F(x_in, x_cat, c_noise.flatten(), t_for_rank=t)
         elif self.net_conditioning == "t":
-            F_x, x_cat_pred = self.denoise_fn_F(x_in, x_cat, t)
+            F_x, x_cat_pred = self.denoise_fn_F(x_in, x_cat, t, t_for_rank=t)
 
         assert F_x.dtype == dtype
         D_x = c_skip * x_num + c_out * F_x.to(torch.float32)
@@ -158,10 +210,10 @@ class Model(nn.Module):
         else:
             self.denoise_fn_D = denoise_fn
 
-    def forward(self, x_num, x_cat, t, sigma=None):
+    def forward(self, x_num, x_cat, t, sigma=None, t_for_rank=None):
         if self.precond:
             return self.denoise_fn_D(x_num, x_cat, t, sigma)
         else:
-            return self.denoise_fn_D(x_num, x_cat, t)
+            return self.denoise_fn_D(x_num, x_cat, t, t_for_rank=t_for_rank)
 
 

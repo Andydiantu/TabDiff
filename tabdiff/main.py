@@ -157,6 +157,9 @@ def main(args):
     ## Load the module and models
     raw_config['unimodmlp_params']['d_numerical'] = d_numerical
     raw_config['unimodmlp_params']['categories'] = (categories+1).tolist()  # add one for the mask category
+    raw_config['unimodmlp_params']['low_rank_mode'] = args.low_rank_mode
+    raw_config['unimodmlp_params']['rank_percentage'] = args.rank_percentage
+    raw_config['unimodmlp_params']['dynamic_rank_init_mode'] = args.dynamic_rank_init
     if args.y_only:
         raw_config['unimodmlp_params']['use_mlp'] = False     # drop the mlp when training the unconditional model
         raw_config['unimodmlp_params']['dim_t'] = 128   #reduce the size of the mlp

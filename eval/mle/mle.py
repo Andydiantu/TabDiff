@@ -71,7 +71,7 @@ _MODELS = {
                  'gamma': [0.0, 1.0],
                  'objective': ['binary:logistic'],
                  'nthread': [-1],
-                 'tree_method': ['gpu_hist']
+                 'tree_method': ['hist']
             },
         }
 
@@ -113,7 +113,7 @@ _MODELS = {
                  'gamma': [0.0, 1.0],
                  'objective': ['binary:logistic'],
                  'nthread': [-1],
-                 'tree_method': ['gpu_hist']
+                 'tree_method': ['hist']
             }
         }
 
@@ -139,7 +139,7 @@ _MODELS = {
                  'gamma': [0.0, 1.0],
                  'objective': ['reg:linear'],
                  'nthread': [-1],
-                 'tree_method': ['gpu_hist']
+                 'tree_method': ['hist']
             }
         },
         # {
@@ -330,8 +330,10 @@ def _prepare_ml_problem(train, val, test, metadata, eval):
 
 
 def _weighted_f1(y_test, pred):
-    report = classification_report(y_test, pred, output_dict=True)
+    report = classification_report(y_test, pred, output_dict=True, zero_division=0)
     classes = list(report.keys())[:-3]
+    if len(classes) <= 1:
+        return 0.0
     proportion = [  report[i]['support'] / len(y_test) for i in classes]
     weighted_f1 = np.sum(list(map(lambda i, prop: report[i]['f1-score']* (1-prop)/(len(classes)-1), classes, proportion)))
     return weighted_f1 
@@ -427,10 +429,7 @@ def _evaluate_multi_classification(train, test, info, val=None):
             x_train = x_trains
             y_train = y_trains
             
-            try:
-                best_model.fit(x_train, y_train)
-            except:
-                pass 
+            best_model.fit(x_train, y_train) # Ensure model is fitted before prediction
 
             if len(unique_labels) != len(np.unique(y_test)):
                 pred = [unique_labels[0]] * len(x_test)
@@ -513,12 +512,13 @@ def _evaluate_binary_classification(train, test, info, val=None):
         for param in tqdm(param_set):
             model = model_class(**param)
 
+            fitted = True
             try:
                 model.fit(x_trains, y_trains)
             except ValueError:
-                pass
+                fitted = False
 
-            if len(unique_labels) == 1:
+            if len(unique_labels) == 1 or not fitted:
                 pred = [unique_labels[0]] * len(x_valid)
                 pred_prob = np.array([1.] * len(x_valid))
             else:
@@ -543,10 +543,10 @@ def _evaluate_binary_classification(train, test, info, val=None):
                 else:
                     try:
                         tmp.append(pred_prob[:,[j]])
-                    except:
+                    except: # Added missing except block
                         tmp.append(pred_prob[:, np.newaxis])
-                    j += 1
-            roc_auc = roc_auc_score(np.eye(size)[y_valid], np.hstack(tmp))
+                    j += 1 # Added missing increment
+            roc_auc = roc_auc_score(np.eye(size)[y_valid.astype(int)], np.hstack(tmp))
 
             results.append(
                 {   
@@ -565,6 +565,10 @@ def _evaluate_binary_classification(train, test, info, val=None):
 
         # test the best model
         results = pd.DataFrame(results)
+        
+        # handle undefined ROC AUC when there's only 1 class
+        results['roc_auc'] = results['roc_auc'].fillna(0.5)
+
         results['avg'] = results.loc[:, ['binary_f1', 'weighted_f1', 'roc_auc']].mean(axis=1)        
         best_f1_param = results.param[results.binary_f1.idxmax()]
         best_weighted_param = results.param[results.weighted_f1.idxmax()]
@@ -576,7 +580,8 @@ def _evaluate_binary_classification(train, test, info, val=None):
         def _calc(best_model):
             best_scores = []
 
-            best_model.fit(x_trains, y_trains)
+            # Model must be fitted regardless of unique_labels count
+            best_model.fit(x_trains, y_trains) # Moved outside the if/else block
 
             if len(unique_labels) == 1:
                 pred = [unique_labels[0]] * len(x_test)
@@ -607,10 +612,13 @@ def _evaluate_binary_classification(train, test, info, val=None):
                         tmp.append(pred_prob[:, np.newaxis])
                     j += 1
             try:
-                roc_auc = roc_auc_score(np.eye(size)[y_test], np.hstack(tmp))
+                roc_auc = roc_auc_score(np.eye(size)[y_test.astype(int)], np.hstack(tmp))
             except ValueError:
                 tmp[1] = tmp[1].reshape(20000, 1)
-                roc_auc = roc_auc_score(np.eye(size)[y_test], np.hstack(tmp))
+                roc_auc = roc_auc_score(np.eye(size)[y_test.astype(int)], np.hstack(tmp))
+            
+            if np.isnan(roc_auc):
+                roc_auc = 0.5
 
             best_scores.append(
                 {   

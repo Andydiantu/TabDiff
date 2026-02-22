@@ -19,6 +19,11 @@ if __name__ == '__main__':
     parser.add_argument('--y_only', action='store_true', help='Train guidance model that only model the target column')
     parser.add_argument('--non_learnable_schedule', action='store_true', help='disable learnable noise schedule')
     
+    # Low-rank configs
+    parser.add_argument('--low_rank_mode', type=str, default='none', choices=['none', 'static', 'dynamic'], help='Low-rank mode: none, static, or dynamic (timestep-dependent)')
+    parser.add_argument('--rank_percentage', type=float, default=0.5, help='Fraction of dense params to retain in low-rank layers')
+    parser.add_argument('--dynamic_rank_init', type=str, default='match_high_rank', choices=['match_high_rank', 'match_expected_rank'], help='Dynamic low-rank init mode')
+
     # Configs for testing tabdiff
     parser.add_argument('--num_samples_to_generate', type=int, default=None, help='Number of samples to be generated while testing')
     parser.add_argument('--ckpt_path', type=str, default=None, help='Path to the model checkpoint to be tested')
