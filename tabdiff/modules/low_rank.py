@@ -1,13 +1,19 @@
 """Low-rank linear layer for parameter-efficient pretraining.
 
-Supports both static low-rank and timestep-dependent (dynamic) low-rank
-modes.  When timestep-dependent mode is active, the number of active rank
-slices is determined per-sample by a logistic schedule over the
-diffusion timestep t ∈ [0, 1].
+Supports static low-rank, timestep-dependent (dynamic) low-rank with a
+fixed logistic schedule, and a **learnable** rank schedule with
+differentiable soft masking.
 
-The default schedule maps low t (clean) → high rank, high t (noisy) → low
-rank.  Setting ``_reverse_schedule = True`` reverses this so that high t
-(noisy) → high rank and low t (clean) → low rank.
+Dynamic mode:
+  The number of active rank slices is determined per-sample by a logistic
+  schedule over the diffusion timestep t ∈ [0, 1].  The default schedule
+  maps low t (clean) → high rank, high t (noisy) → low rank.  Setting
+  ``_reverse_schedule = True`` reverses this.
+
+Learnable mode:
+  Uses ``LearnableRankSchedule`` — a power-mean interpolation with two
+  learnable parameters (shape α and floor ρ_min) and differentiable
+  sigmoid gating.
 """
 
 import math
@@ -15,6 +21,116 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class LearnableRankSchedule(nn.Module):
+  """Power-mean rank schedule with learnable shape (α) and floor (ρ_min).
+
+  Schedule:  r(t) = r_max · [ρ_min + (1 − ρ_min) · t^α]
+
+  Parameters
+  ----------
+  r_max : int
+      Maximum rank (number of rank components in the layer).
+  alpha_init : float
+      Initial value for α (1.0 = linear schedule at init).
+  rho_min_init : float
+      Initial value for ρ_min (floor fraction, in (0, 1)).
+  softplus_offset : float
+      Small constant ensuring α > 0 after softplus.
+  mask_temperature : float
+      Temperature β for the sigmoid soft mask (higher = sharper).
+  """
+
+  def __init__(
+      self,
+      r_max: int,
+      alpha_init: float = 1.0,
+      rho_min_init: float = 0.5,
+      softplus_offset: float = 0.01,
+      mask_temperature: float = 5.0,
+  ):
+    super().__init__()
+    self.r_max = r_max
+    self.softplus_offset = softplus_offset
+    self.mask_temperature = mask_temperature
+
+    # α: shape parameter via softplus reparameterisation
+    alpha_raw_init = self._inverse_softplus(alpha_init - softplus_offset)
+    self.alpha_raw = nn.Parameter(
+        torch.tensor(alpha_raw_init, dtype=torch.float32))
+
+    # ρ_min: floor fraction via sigmoid reparameterisation
+    rho_raw_init = self._inverse_sigmoid(rho_min_init)
+    self.rho_raw = nn.Parameter(
+        torch.tensor(rho_raw_init, dtype=torch.float32))
+
+  # ---- helpers ----------------------------------------------------------
+
+  @staticmethod
+  def _inverse_softplus(y: float) -> float:
+    """Inverse of softplus: x = log(exp(y) − 1)."""
+    if y > 20:
+      return y  # softplus ≈ identity for large y
+    return math.log(math.exp(y) - 1) if y > 0 else y
+
+  @staticmethod
+  def _inverse_sigmoid(y: float) -> float:
+    """Inverse of sigmoid: x = log(y / (1 − y))."""
+    y = max(1e-6, min(y, 1 - 1e-6))
+    return math.log(y / (1 - y))
+
+  # ---- properties -------------------------------------------------------
+
+  @property
+  def alpha(self) -> torch.Tensor:
+    """Shape parameter α > 0."""
+    return F.softplus(self.alpha_raw) + self.softplus_offset
+
+  @property
+  def rho_min(self) -> torch.Tensor:
+    """Floor fraction ρ_min ∈ (0, 1)."""
+    return torch.sigmoid(self.rho_raw)
+
+  # ---- schedule functions -----------------------------------------------
+
+  def rank_fraction(self, t: torch.Tensor) -> torch.Tensor:
+    """ρ(t) = ρ_min + (1 − ρ_min) · t^α,  returns values in [ρ_min, 1]."""
+    rho_min = self.rho_min
+    return rho_min + (1 - rho_min) * t.clamp(1e-8, 1.0).pow(self.alpha)
+
+  def soft_mask(self, t: torch.Tensor) -> torch.Tensor:
+    """Differentiable per-component gate.
+
+    Args:
+      t: [B] float tensor, diffusion timestep in [0, 1].
+
+    Returns:
+      [B, r_max] gate values in (0, 1).
+    """
+    effective_r = self.rank_fraction(t) * self.r_max  # [B]
+    j = torch.arange(
+        1, self.r_max + 1, device=t.device, dtype=t.dtype)  # [r_max]
+    return torch.sigmoid(
+        self.mask_temperature
+        * (effective_r.unsqueeze(-1) - j.unsqueeze(0) + 0.5)
+    )  # [B, r_max]
+
+  def expected_rank(self, sampling_eps: float = 1e-3) -> torch.Tensor:
+    """Closed-form expected rank.  Differentiable through α and ρ_min.
+
+    E[r] = r_max · [ρ_min + (1 − ρ_min) / (α + 1)]   (for ε ≈ 0)
+    """
+    alpha = self.alpha
+    rho_min = self.rho_min
+    eps = sampling_eps
+    e_t_alpha = (1 - eps ** (alpha + 1)) / ((alpha + 1) * (1 - eps))
+    return self.r_max * (rho_min + (1 - rho_min) * e_t_alpha)
+
+  def expected_flops(self, d_in: int, d_out: int,
+                     sampling_eps: float = 1e-3) -> torch.Tensor:
+    """Expected FLOPs for this layer.  Differentiable through α and ρ_min."""
+    return 2 * (d_in + d_out) * self.expected_rank(sampling_eps)
 
 
 class LowRankLinear(nn.Module):
@@ -53,11 +169,13 @@ class LowRankLinear(nn.Module):
       out_features: int,
       rank_percentage: float = 1.0,
       bias: bool = False,
+      mode: str = 'static',
   ):
     super().__init__()
     self.in_features = in_features
     self.out_features = out_features
     self.rank_percentage = rank_percentage
+    self.mode = mode  # 'static', 'dynamic', or 'learnable'
 
     # Compute rank from the target parameter-count percentage.
     dense_params = in_features * out_features
@@ -85,6 +203,11 @@ class LowRankLinear(nn.Module):
     self._logistic_k: float = 8.0
     self._logistic_m: float = 0.6
     self._reverse_schedule: bool = False  # if True, high noise → high rank
+
+    # ----- learnable rank schedule (only for mode='learnable') -----
+    self.schedule: LearnableRankSchedule | None = None
+    if mode == 'learnable':
+      self.schedule = LearnableRankSchedule(r_max=rank)
 
     self.reset_parameters()
 
@@ -241,7 +364,43 @@ class LowRankLinear(nn.Module):
       # x @ B^T  → (..., rank), then  @ A^T → (..., out_features)
       return F.linear(F.linear(x, self.B), self.A, self.bias)
 
-    # ---- timestep-dependent path -----------------------------------
+    # ---- learnable schedule path (differentiable soft mask) --------
+    if self.schedule is not None:
+      return self._forward_learnable(x)
+
+    # ---- dynamic (logistic) path -----------------------------------
+    return self._forward_dynamic(x)
+
+  def _forward_learnable(self, x: torch.Tensor) -> torch.Tensor:
+    """Forward with learnable schedule and differentiable soft mask."""
+    t = self._timestep  # [B]  t ∈ [0, 1]
+
+    B_x = x.shape[0]
+    B_t = t.shape[0]
+
+    # Expand t if batch dims differ
+    if B_x == B_t:
+      t_expanded = t
+    elif B_x % B_t == 0:
+      repeat = B_x // B_t
+      t_expanded = t.unsqueeze(1).expand(-1, repeat).contiguous().view(-1)
+    else:
+      repeat = math.ceil(B_x / B_t)
+      t_expanded = t.unsqueeze(1).expand(-1, repeat).contiguous().view(-1)[:B_x]
+
+    mask = self.schedule.soft_mask(t_expanded)  # [B_x, rank]
+
+    Bx = F.linear(x, self.B)                   # (..., rank)
+
+    # Handle 3-D tensors (batch, seq, rank)
+    if Bx.dim() == 3:
+      mask = mask.unsqueeze(1)                  # [B_x, 1, rank]
+
+    Bx = Bx * mask
+    return F.linear(Bx, self.A, self.bias)
+
+  def _forward_dynamic(self, x: torch.Tensor) -> torch.Tensor:
+    """Forward with the fixed logistic (dynamic) schedule."""
     t = self._timestep             # [B]  t ∈ [0, 1]
 
     B_x = x.shape[0]

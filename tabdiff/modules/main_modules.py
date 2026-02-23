@@ -55,7 +55,8 @@ class MLPDiffusion(nn.Module):
                         sampling_eps=1e-3,
                         mode=dynamic_rank_init_mode,
                     )
-                return LowRankLinear(in_f, out_f, rank_percentage=pct, bias=bias)
+                return LowRankLinear(in_f, out_f, rank_percentage=pct, bias=bias,
+                                     mode=low_rank_mode)
 
         self.mlp = nn.Sequential(
             _make_linear(dim_t, dim_t * 2),
@@ -95,12 +96,12 @@ class MLPDiffusion(nn.Module):
     
         x = self.proj(x) + emb
 
-        if self.low_rank_mode == 'dynamic' and t_for_rank is not None:
+        if self.low_rank_mode in ('dynamic', 'learnable') and t_for_rank is not None:
             self._inject_timestep(t_for_rank)
 
         out = self.mlp(x)
 
-        if self.low_rank_mode == 'dynamic' and t_for_rank is not None:
+        if self.low_rank_mode in ('dynamic', 'learnable') and t_for_rank is not None:
             self._clear_timestep()
 
         return out

@@ -33,6 +33,8 @@ class Trainer:
             closs_weight_schedule = "fixed",
             c_lambda = 1.0,
             d_lambda = 1.0,
+            flops_lambda = 0.0,
+            target_activation_ratio = 0.5,
             device=torch.device('cuda:1'),
             ckpt_path = None,
             y_only=False,
@@ -62,6 +64,8 @@ class Trainer:
         self.closs_weight_schedule = closs_weight_schedule
         self.c_lambda = c_lambda
         self.d_lambda = d_lambda
+        self.flops_lambda = flops_lambda
+        self.target_activation_ratio = target_activation_ratio
 
         self.batch_size = batch_size
         self.sample_batch_size = sample_batch_size
@@ -89,6 +93,19 @@ class Trainer:
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
 
+    def _compute_flops_loss(self):
+        """Squared error between expected and target activation ratio."""
+        from tabdiff.modules.low_rank import LowRankLinear
+        ratios = []
+        for module in self.diffusion.modules():
+            if isinstance(module, LowRankLinear) and module.schedule is not None:
+                expected = module.schedule.expected_rank()
+                ratios.append(expected / module.rank)
+        if not ratios:
+            return torch.tensor(0.0, device=self.device)
+        mean_ratio = torch.stack(ratios).mean()
+        return (mean_ratio - self.target_activation_ratio) ** 2
+
     def _run_step(self, x, closs_weight, dloss_weight):
         x = x.to(self.device)
         
@@ -98,11 +115,12 @@ class Trainer:
 
         dloss, closs = self.diffusion.mixed_loss(x)
 
-        loss = dloss_weight * dloss + closs_weight * closs
+        flops_loss = self._compute_flops_loss()
+        loss = dloss_weight * dloss + closs_weight * closs + self.flops_lambda * flops_loss
         loss.backward()
         self.optimizer.step()
 
-        return dloss, closs
+        return dloss, closs, flops_loss
     
     def compute_loss(self):      # eval loss is not weighted
         curr_dloss = 0.0
@@ -154,13 +172,15 @@ class Trainer:
             # Training Step
             curr_dloss = 0.0
             curr_closs = 0.0
+            curr_flops_loss = 0.0
             curr_count = 0
             curr_lr = self.optimizer.param_groups[0]['lr']
             for batch in pbar:
                 x = batch.float().to(self.device)
-                batch_dloss, batch_closs = self._run_step(x, closs_weight, dloss_weight)
+                batch_dloss, batch_closs, batch_flops_loss = self._run_step(x, closs_weight, dloss_weight)
                 curr_dloss += batch_dloss.item() * len(x)
                 curr_closs += batch_closs.item() * len(x)
+                curr_flops_loss += batch_flops_loss.item() * len(x)
                 curr_count += len(x)
                 pbar.set_postfix({
                     "lr": curr_lr,
@@ -186,7 +206,8 @@ class Trainer:
                 "dloss_weight": dloss_weight,
                 "loss/c_loss": gloss,
                 "loss/d_loss": mloss,
-                "loss/total_loss": total_loss
+                "loss/total_loss": total_loss,
+                "loss/flops_loss": np.around(curr_flops_loss / curr_count, 6),
             }
             log_dict.update(loss_dict)
             
@@ -207,6 +228,20 @@ class Trainer:
                 else:
                     cat_noise_dict = {f"cat_noise/k_col_{i}": value.item() for i, value in enumerate(self.diffusion.cat_schedule.k())}
                 log_dict.update(cat_noise_dict)
+            
+            # Log learnable rank schedule parameters
+            from tabdiff.modules.low_rank import LowRankLinear
+            rank_schedule_dict = {}
+            layer_idx = 0
+            for module in self.diffusion.modules():
+                if isinstance(module, LowRankLinear) and module.schedule is not None:
+                    rank_schedule_dict[f"rank_schedule/layer_{layer_idx}/alpha"] = module.schedule.alpha.item()
+                    rank_schedule_dict[f"rank_schedule/layer_{layer_idx}/rho_min"] = module.schedule.rho_min.item()
+                    rank_schedule_dict[f"rank_schedule/layer_{layer_idx}/expected_rank"] = module.schedule.expected_rank().item()
+                    rank_schedule_dict[f"rank_schedule/layer_{layer_idx}/expected_ratio"] = (module.schedule.expected_rank() / module.rank).item()
+                    layer_idx += 1
+            if rank_schedule_dict:
+                log_dict.update(rank_schedule_dict)
             
             # Adjust learning rate
             if self.lr_scheduler == 'reduce_lr_on_plateau':

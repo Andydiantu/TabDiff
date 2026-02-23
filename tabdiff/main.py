@@ -157,9 +157,16 @@ def main(args):
     ## Load the module and models
     raw_config['unimodmlp_params']['d_numerical'] = d_numerical
     raw_config['unimodmlp_params']['categories'] = (categories+1).tolist()  # add one for the mask category
-    raw_config['unimodmlp_params']['low_rank_mode'] = args.low_rank_mode
-    raw_config['unimodmlp_params']['rank_percentage'] = args.rank_percentage
-    raw_config['unimodmlp_params']['dynamic_rank_init_mode'] = args.dynamic_rank_init
+    # Only override low-rank config from CLI args during training.
+    # In test mode, use the cached config so the model architecture matches the checkpoint.
+    # Provide fallbacks for older configs that don't have low-rank keys.
+    raw_config['unimodmlp_params'].setdefault('low_rank_mode', 'none')
+    raw_config['unimodmlp_params'].setdefault('rank_percentage', 0.5)
+    raw_config['unimodmlp_params'].setdefault('dynamic_rank_init_mode', 'match_high_rank')
+    if args.mode == 'train':
+        raw_config['unimodmlp_params']['low_rank_mode'] = args.low_rank_mode
+        raw_config['unimodmlp_params']['rank_percentage'] = args.rank_percentage
+        raw_config['unimodmlp_params']['dynamic_rank_init_mode'] = args.dynamic_rank_init
     if args.y_only:
         raw_config['unimodmlp_params']['use_mlp'] = False     # drop the mlp when training the unconditional model
         raw_config['unimodmlp_params']['dim_t'] = 128   #reduce the size of the mlp
@@ -258,7 +265,9 @@ def main(args):
         result_save_path=raw_config['result_save_path'],
         device=device,
         ckpt_path=ckpt_path,
-        y_only=args.y_only
+        y_only=args.y_only,
+        flops_lambda=args.flops_lambda,
+        target_activation_ratio=args.target_activation_ratio,
     )
     if args.mode == 'test':
         if args.report:
