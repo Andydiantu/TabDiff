@@ -163,10 +163,23 @@ def main(args):
     raw_config['unimodmlp_params'].setdefault('low_rank_mode', 'none')
     raw_config['unimodmlp_params'].setdefault('rank_percentage', 0.5)
     raw_config['unimodmlp_params'].setdefault('dynamic_rank_init_mode', 'match_high_rank')
+    raw_config['unimodmlp_params'].setdefault('learnable_gate_mode', 'soft')
+    raw_config['unimodmlp_params'].setdefault('learnable_gate_threshold', 0.5)
+    raw_config['unimodmlp_params'].setdefault('learnable_min_active_rank', 1)
+    raw_config['unimodmlp_params'].setdefault('learnable_eval_slice', True)
     if args.mode == 'train':
+        learnable_gate_mode = getattr(args, 'learnable_gate_mode', 'soft')
+        learnable_gate_threshold = getattr(args, 'learnable_gate_threshold', 0.5)
+        allow_zero_hard_rank = getattr(args, 'allow_zero_hard_rank', False)
+        learnable_eval_slice = getattr(args, 'learnable_eval_slice', 'on')
+
         raw_config['unimodmlp_params']['low_rank_mode'] = args.low_rank_mode
         raw_config['unimodmlp_params']['rank_percentage'] = args.rank_percentage
         raw_config['unimodmlp_params']['dynamic_rank_init_mode'] = args.dynamic_rank_init
+        raw_config['unimodmlp_params']['learnable_gate_mode'] = learnable_gate_mode
+        raw_config['unimodmlp_params']['learnable_gate_threshold'] = learnable_gate_threshold
+        raw_config['unimodmlp_params']['learnable_min_active_rank'] = 0 if allow_zero_hard_rank else 1
+        raw_config['unimodmlp_params']['learnable_eval_slice'] = (learnable_eval_slice == 'on')
     if args.y_only:
         raw_config['unimodmlp_params']['use_mlp'] = False     # drop the mlp when training the unconditional model
         raw_config['unimodmlp_params']['dim_t'] = 128   #reduce the size of the mlp

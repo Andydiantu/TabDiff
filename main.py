@@ -23,6 +23,10 @@ if __name__ == '__main__':
     parser.add_argument('--low_rank_mode', type=str, default='none', choices=['none', 'static', 'dynamic', 'learnable'], help='Low-rank mode: none, static, dynamic (timestep-dependent), or learnable (differentiable schedule)')
     parser.add_argument('--rank_percentage', type=float, default=0.5, help='Fraction of dense params to retain in low-rank layers')
     parser.add_argument('--dynamic_rank_init', type=str, default='match_high_rank', choices=['match_high_rank', 'match_expected_rank'], help='Dynamic low-rank init mode')
+    parser.add_argument('--learnable_gate_mode', type=str, default='soft', choices=['soft', 'hard_ste'], help='Learnable rank gate mode: differentiable soft gating or hard threshold with STE')
+    parser.add_argument('--learnable_gate_threshold', type=float, default=0.5, help='Threshold tau for hard_ste learnable gating')
+    parser.add_argument('--allow_zero_hard_rank', action='store_true', help='Allow zero active rank under hard_ste gating (default enforces at least one active rank)')
+    parser.add_argument('--learnable_eval_slice', type=str, default='on', choices=['on', 'off'], help='Enable eval-only sliced matmul fast path for uniform hard active rank')
     parser.add_argument('--flops_lambda', type=float, default=0.0, help='Weight for FLOPs constraint loss (0 = disabled)')
     parser.add_argument('--target_activation_ratio', type=float, default=0.5, help='Target expected activation ratio for FLOPs loss')
 

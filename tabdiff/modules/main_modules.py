@@ -31,7 +31,11 @@ class PositionalEmbedding(torch.nn.Module):
 class MLPDiffusion(nn.Module):
     def __init__(self, d_in, dim_t = 512, use_mlp=True,
                  low_rank_mode='none', rank_percentage=0.5,
-                 dynamic_rank_init_mode='match_high_rank'):
+                 dynamic_rank_init_mode='match_high_rank',
+                 learnable_gate_mode='soft',
+                 learnable_gate_threshold=0.5,
+                 learnable_min_active_rank=1,
+                 learnable_eval_slice=True):
         super().__init__()
         self.dim_t = dim_t
         self.low_rank_mode = low_rank_mode
@@ -55,8 +59,17 @@ class MLPDiffusion(nn.Module):
                         sampling_eps=1e-3,
                         mode=dynamic_rank_init_mode,
                     )
-                return LowRankLinear(in_f, out_f, rank_percentage=pct, bias=bias,
-                                     mode=low_rank_mode)
+                return LowRankLinear(
+                    in_f,
+                    out_f,
+                    rank_percentage=pct,
+                    bias=bias,
+                    mode=low_rank_mode,
+                    learnable_gate_mode=learnable_gate_mode,
+                    learnable_gate_threshold=learnable_gate_threshold,
+                    learnable_min_active_rank=learnable_min_active_rank,
+                    learnable_eval_slice=learnable_eval_slice,
+                )
 
         self.mlp = nn.Sequential(
             _make_linear(dim_t, dim_t * 2),
@@ -120,6 +133,10 @@ class UniModMLP(nn.Module):
             n_head = 1, factor = 4, bias = True, dim_t=512, use_mlp=True,
             low_rank_mode='none', rank_percentage=0.5,
             dynamic_rank_init_mode='match_high_rank',
+            learnable_gate_mode='soft',
+            learnable_gate_threshold=0.5,
+            learnable_min_active_rank=1,
+            learnable_eval_slice=True,
             **kwargs
         ):
         super().__init__()
@@ -134,6 +151,10 @@ class UniModMLP(nn.Module):
             low_rank_mode=low_rank_mode,
             rank_percentage=rank_percentage,
             dynamic_rank_init_mode=dynamic_rank_init_mode,
+            learnable_gate_mode=learnable_gate_mode,
+            learnable_gate_threshold=learnable_gate_threshold,
+            learnable_min_active_rank=learnable_min_active_rank,
+            learnable_eval_slice=learnable_eval_slice,
         )
         self.decoder = Transformer(num_layers, d_token, n_head, d_token, factor)
         self.detokenizer = Reconstructor(d_numerical, categories, d_token)
@@ -216,5 +237,4 @@ class Model(nn.Module):
             return self.denoise_fn_D(x_num, x_cat, t, sigma)
         else:
             return self.denoise_fn_D(x_num, x_cat, t, t_for_rank=t_for_rank)
-
 
